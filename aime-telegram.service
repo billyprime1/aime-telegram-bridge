@@ -1,0 +1,17 @@
+[Unit]
+Description=AIME Telegram Operator Console
+After=network.target aime-runner.service
+Wants=aime-runner.service
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/aime-telegram-bot
+EnvironmentFile=/opt/aime-telegram-bot/.env
+ExecStart=/opt/aime-telegram-bot/venv/bin/python bot.py
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
