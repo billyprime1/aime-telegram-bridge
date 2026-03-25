@@ -30,6 +30,11 @@ AGENT_RUNNER_URL = os.getenv("AGENT_RUNNER_URL", "http://localhost:8100")
 AGENT_ID = int(os.getenv("AGENT_ID", "71"))
 API_KEY = os.getenv("AGENT_RUNNER_API_KEY", "aime-runner-pag-2026")
 USER_ID = os.getenv("AIME_USER_ID", "c832b518-8d44-41dd-ac74-b75500d7ce4b")
+LEAD_PULLER_URL = os.getenv("LEAD_PULLER_URL", "http://localhost:8200")
+LEAD_PULLER_KEY = os.getenv("LEAD_PULLER_KEY", "aime-cognitive-pag-2026")
+
+VALID_VERTICALS = ["medspa", "dental", "saas", "ecommerce", "cpa_accounting", "pharma", "manufacturing", "fintech", "all"]
+VALID_SIDES = ["seller", "buyer", "both"]
 
 # Telegram message limit
 TG_MAX_LEN = 4000
@@ -129,6 +134,7 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• \"Draft an LOI for the medspa deal at $2.5M\"\n"
         "• \"Show me the buyer pipeline status\"\n"
         "• \"Search for SaaS companies doing $500K+ ARR in Texas\"\n\n"
+        "/leads — Lead puller (pull, status, credits, jobs)\n"
         "/status — Quick system health\n"
         "/reset — Fresh conversation\n"
     )
@@ -165,6 +171,193 @@ async def reset_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global _session_id
     _session_id = None
     await update.message.reply_text("🔄 Conversation reset. Fresh context.")
+
+
+# ── Lead Puller Commands ──
+
+async def leads_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /leads command for pulling leads.
+    Usage:
+      /leads pull <vertical> <side> <target>
+      /leads status <job_id>
+      /leads credits
+      /leads jobs
+    Examples:
+      /leads pull dental seller 50
+      /leads pull all both 20
+      /leads status abc123
+      /leads credits
+    """
+    if not is_owner(update):
+        return
+
+    args = context.args or []
+    if not args:
+        await update.message.reply_text(
+            "🔍 Lead Puller Commands\n\n"
+            "/leads pull <vertical> <side> <target>\n"
+            "  Start a new lead pull\n"
+            "  Verticals: medspa, dental, saas, ecommerce, cpa_accounting, pharma, manufacturing, fintech, all\n"
+            "  Sides: seller, buyer, both\n"
+            "  Target: leads per vertical (5-200)\n\n"
+            "/leads status <job_id>\n"
+            "  Check status of a running job\n\n"
+            "/leads credits\n"
+            "  Check LeadMagic credit balance\n\n"
+            "/leads jobs\n"
+            "  Show recent pull jobs\n\n"
+            "Examples:\n"
+            "  /leads pull dental seller 50\n"
+            "  /leads pull all both 20\n"
+            "  /leads credits"
+        )
+        return
+
+    subcmd = args[0].lower()
+    await update.message.chat.send_action(ChatAction.TYPING)
+
+    if subcmd == "pull":
+        # Parse: /leads pull <vertical> <side> <target>
+        if len(args) < 4:
+            await update.message.reply_text(
+                "⚠️ Usage: /leads pull <vertical> <side> <target>\n"
+                "Example: /leads pull dental seller 50"
+            )
+            return
+
+        vertical = args[1].lower()
+        side = args[2].lower()
+        try:
+            target = min(200, max(5, int(args[3])))
+        except ValueError:
+            await update.message.reply_text("⚠️ Target must be a number (5-200)")
+            return
+
+        if vertical not in VALID_VERTICALS:
+            await update.message.reply_text(f"⚠️ Invalid vertical: {vertical}\nValid: {', '.join(VALID_VERTICALS)}")
+            return
+        if side not in VALID_SIDES:
+            await update.message.reply_text(f"⚠️ Invalid side: {side}\nValid: seller, buyer, both")
+            return
+
+        try:
+            async with httpx.AsyncClient(timeout=30) as client:
+                resp = await client.post(
+                    f"{LEAD_PULLER_URL}/pull",
+                    headers={"X-API-Key": LEAD_PULLER_KEY, "Content-Type": "application/json"},
+                    json={"vertical": vertical, "side": side, "target": target, "max_credits": 2000},
+                )
+                data = resp.json()
+
+            if resp.status_code in (200, 201, 202):
+                job_id = data.get("job_id", "?")
+                est_credits = round(target * (8 if vertical == "all" else 1) * 1.4)
+                await update.message.reply_text(
+                    f"🚀 Lead Pull Started\n\n"
+                    f"• Job: {job_id}\n"
+                    f"• Vertical: {vertical}\n"
+                    f"• Side: {side}\n"
+                    f"• Target: {target}/vertical\n"
+                    f"• Est. credits: ~{est_credits}\n\n"
+                    f"Check status: /leads status {job_id}"
+                )
+            else:
+                await update.message.reply_text(f"⚠️ {data.get('error', 'Unknown error')}")
+        except Exception as e:
+            await update.message.reply_text(f"❌ Lead puller service error: {str(e)[:200]}")
+
+    elif subcmd == "status":
+        if len(args) < 2:
+            await update.message.reply_text("⚠️ Usage: /leads status <job_id>")
+            return
+
+        job_id = args[1]
+        try:
+            async with httpx.AsyncClient(timeout=15) as client:
+                resp = await client.get(
+                    f"{LEAD_PULLER_URL}/status/{job_id}",
+                    headers={"X-API-Key": LEAD_PULLER_KEY},
+                )
+                data = resp.json()
+
+            if resp.status_code == 404:
+                await update.message.reply_text(f"⚠️ Job {job_id} not found")
+                return
+
+            status_emoji = {
+                "completed": "✅", "running": "⏳", "queued": "📦", "failed": "❌"
+            }.get(data.get("status"), "❓")
+
+            msg = f"{status_emoji} Job {data.get('id', job_id)} — {data.get('status', '?').upper()}\n"
+            msg += f"• Vertical: {data.get('vertical')} | Side: {data.get('side')}\n"
+
+            progress = data.get("progress", {})
+            if progress and data.get("status") in ("running", "queued"):
+                msg += f"• Leads found: {progress.get('leads_found', 0)}\n"
+                msg += f"• Credits used: {progress.get('credits_used', 0)}\n"
+                if progress.get("current_vertical"):
+                    msg += f"• Current: {progress.get('current_side')} / {progress.get('current_vertical')}\n"
+
+            results = data.get("results")
+            if results and data.get("status") == "completed":
+                msg += f"\n📊 Results:\n"
+                msg += f"• Total leads: {results.get('total_leads', 0)}\n"
+                by_side = results.get("leads_by_side", {})
+                msg += f"• Sellers: {by_side.get('seller', 0)} | Buyers: {by_side.get('buyer', 0)}\n"
+                msg += f"• LM credits used: {results.get('credits_used', 0)}\n"
+                by_vert = results.get("leads_by_vertical", {})
+                if by_vert:
+                    msg += "\nBy vertical:\n"
+                    for v, c in sorted(by_vert.items()):
+                        msg += f"  {v}: {c}\n"
+
+            if data.get("error"):
+                msg += f"\n❌ Error: {data['error']}"
+
+            await update.message.reply_text(msg)
+        except Exception as e:
+            await update.message.reply_text(f"❌ Error: {str(e)[:200]}")
+
+    elif subcmd == "credits":
+        try:
+            async with httpx.AsyncClient(timeout=15) as client:
+                resp = await client.get(
+                    f"{LEAD_PULLER_URL}/credits",
+                    headers={"X-API-Key": LEAD_PULLER_KEY},
+                )
+                data = resp.json()
+
+            remaining = data.get("credits_remaining", data.get("credits", "?"))
+            await update.message.reply_text(f"💳 LeadMagic Credits: {remaining:,}" if isinstance(remaining, (int, float)) else f"💳 LeadMagic: {remaining}")
+        except Exception as e:
+            await update.message.reply_text(f"❌ Error checking credits: {str(e)[:200]}")
+
+    elif subcmd == "jobs":
+        try:
+            async with httpx.AsyncClient(timeout=15) as client:
+                resp = await client.get(
+                    f"{LEAD_PULLER_URL}/jobs",
+                    headers={"X-API-Key": LEAD_PULLER_KEY},
+                )
+                data = resp.json()
+
+            if not data:
+                await update.message.reply_text("📂 No recent lead pull jobs")
+                return
+
+            msg = "📂 Recent Lead Pulls\n\n"
+            for j in data[:10]:
+                status_emoji = {"completed": "✅", "running": "⏳", "queued": "📦", "failed": "❌"}.get(j.get("status"), "❓")
+                msg += f"{status_emoji} {j.get('id')} — {j.get('vertical')} {j.get('side')} → {j.get('total_leads', 0)} leads\n"
+            await update.message.reply_text(msg)
+        except Exception as e:
+            await update.message.reply_text(f"❌ Error: {str(e)[:200]}")
+
+    else:
+        await update.message.reply_text(
+            f"⚠️ Unknown subcommand: {subcmd}\n"
+            "Use: /leads pull, /leads status, /leads credits, /leads jobs"
+        )
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -271,6 +464,7 @@ def main():
     app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(CommandHandler("status", status_cmd))
     app.add_handler(CommandHandler("reset", reset_cmd))
+    app.add_handler(CommandHandler("leads", leads_cmd))
 
     # Messages
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
